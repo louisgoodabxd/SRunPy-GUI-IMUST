@@ -14,6 +14,8 @@ import math
 import os
 import re
 import socket
+import struct
+import sys
 import time
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
@@ -222,56 +224,153 @@ class SourceIPAdapter(HTTPAdapter):
         return super().proxy_manager_for(proxy, **proxy_kwargs)
 
 
-def _detect_physical_interface_ip() -> Optional[str]:
+def _get_physical_iface_index() -> Optional[int]:
     """
-    Detect the physical network interface IP by connecting to a non-routable
-    address and checking which local IP is used.
-    通过连接一个不可路由地址来检测物理网络接口的本地IP。
+    Get the Windows network interface index for the physical (non-TUN) adapter.
+    通过 route print 获取物理网卡（非 TUN）的接口索引。
 
-    This helps bypass TUN proxy by identifying the real physical interface IP.
-    这有助于绕过 TUN 代理，识别真实的物理接口 IP。
+    This is used to set IP_UNICAST_IF socket option, which forces traffic
+    through the physical interface, bypassing TUN proxy at the OS level.
+    用于设置 IP_UNICAST_IF socket 选项，强制流量走物理网卡，绕过 TUN 代理。
 
     Returns / 返回:
-        Local IP address or None / 本地 IP 地址或 None
+        Interface index or None / 接口索引或 None
     """
-    candidates = set()
-
-    # Method 1: UDP connect to detect routing (no actual traffic sent)
-    # 方法1: UDP 连接检测路由（不发送实际流量）
+    if sys.platform != 'win32':
+        return None
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.settimeout(1)
-            s.connect(("198.51.100.1", 80))
-            candidates.add(s.getsockname()[0])
-    except (OSError, socket.timeout):
-        pass
+        import subprocess
+        # Use route print to get interface list
+        # 使用 route print 获取接口列表
+        result = subprocess.run(
+            ['route', 'print'],
+            capture_output=True, text=True, timeout=5,
+            creationflags=0x08000000  # CREATE_NO_WINDOW
+        )
 
-    # Method 2: Get all non-loopback IPv4 addresses
-    # 方法2: 获取所有非回环 IPv4 地址
+        lines = result.stdout.split('\n')
+        in_iflist = False
+        physical_interfaces = []
+
+        # TUN/tunnel interface keywords to exclude
+        # 需要排除的 TUN/隧道接口关键词
+        tun_keywords = [
+            'clash', 'sing', 'v2ray', 'vless', 'tun', 'wintun',
+            'wireguard', 'tapor', 'loopback', 'isatap', 'teredo',
+            '6to4', 'wan miniport'
+        ]
+
+        for line in lines:
+            if 'Interface List' in line:
+                in_iflist = True
+                continue
+            if in_iflist:
+                line_stripped = line.strip()
+                if not line_stripped or line_stripped.startswith('==='):
+                    break
+                # Format: "  13...xx xx xx xx xx xx  ...Ethernet"
+                # 格式: "  13...xx xx xx xx xx xx  ...以太网"
+                parts = line_stripped.split('...')
+                if len(parts) >= 2:
+                    try:
+                        idx = int(parts[0].strip())
+                        name = parts[-1].strip().lower()
+                        if not any(kw in name for kw in tun_keywords):
+                            physical_interfaces.append(idx)
+                    except (ValueError, IndexError):
+                        pass
+
+        return physical_interfaces[0] if physical_interfaces else None
+    except Exception:
+        return None
+
+
+def _install_tun_bypass(session: requests.Session) -> None:
+    """
+    Install TUN proxy bypass by patching urllib3's socket creation.
+    通过修补 urllib3 的 socket 创建来安装 TUN 代理绕过。
+
+    On Windows, sets IP_UNICAST_IF socket option to force traffic through
+    the physical network interface, bypassing TUN virtual adapter.
+    在 Windows 上设置 IP_UNICAST_IF socket 选项，强制流量走物理网卡，
+    绕过 TUN 虚拟适配器。
+
+    Args / 参数:
+        session: The requests session to patch / 要修补的 requests session
+    """
+    if sys.platform != 'win32':
+        return
+
+    iface_idx = _get_physical_iface_index()
+    if iface_idx is None:
+        return
+
     try:
-        hostname = socket.gethostname()
-        for addr in socket.gethostbyname_ex(hostname)[2]:
-            if not addr.startswith("127."):
-                candidates.add(addr)
-    except socket.gaierror:
-        pass
+        import urllib3.util.connection as urllib3_conn
 
-    # Method 3: getaddrinfo
-    # 方法3: getaddrinfo
-    try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, family=socket.AF_INET):
-            addr = info[4][0]
-            if not addr.startswith("127."):
-                candidates.add(addr)
-    except socket.gaierror:
-        pass
+        # Save original create_connection
+        # 保存原始 create_connection
+        _orig_create = urllib3_conn.create_connection
 
-    # Prefer 10.x.x.x addresses (campus network range)
-    # 优先选择 10.x.x.x 地址（校园网范围）
-    campus_ips = [ip for ip in candidates if ip.startswith("10.")]
-    if campus_ips:
-        return campus_ips[0]
-    return sorted(candidates)[0] if candidates else None
+        # IP_UNICAST_IF = 0x1F (31) - Windows socket option
+        # IP_UNICAST_IF = 0x1F (31) - Windows socket 选项
+        _IP_UNICAST_IF = 0x1F
+        _iface = iface_idx
+
+        def _patched_create_connection(address, timeout=urllib3_conn._DEFAULT_SOCKET_TIMEOUT,
+                                       source_address=None, socket_options=None):
+            """Patched create_connection that sets IP_UNICAST_IF."""
+            host, port = address
+            family, type_ = urllib3_conn._family_and_type(host, port)
+
+            sock = socket.socket(family, type_)
+
+            # Apply socket options
+            # 应用 socket 选项
+            if socket_options:
+                for opt in socket_options:
+                    try:
+                        sock.setsockopt(*opt)
+                    except OSError:
+                        pass
+
+            # Bind to source address if specified
+            # 如果指定了源地址则绑定
+            if source_address:
+                sock.bind(source_address)
+
+            # Set IP_UNICAST_IF to force traffic through physical interface
+            # 设置 IP_UNICAST_IF 强制流量走物理网卡
+            try:
+                val = struct.pack('I', socket.htonl(_iface))
+                sock.setsockopt(socket.IPPROTO_IP, _IP_UNICAST_IF, val)
+            except OSError:
+                pass
+
+            # Connect
+            # 连接
+            sock.connect((host, port))
+            return sock
+
+        # Apply the patch
+        # 应用补丁
+        urllib3_conn.create_connection = _patched_create_connection
+
+        # Also patch the session's adapter to use the patched connection
+        # 同时修补 session 的 adapter 以使用修补后的连接
+        for prefix in ('http://', 'https://'):
+            adapter = session.get_adapter(prefix)
+            if adapter:
+                adapter._patched = True
+
+    except ImportError:
+        # urllib3 version doesn't support this patching method
+        # urllib3 版本不支持此修补方法
+        pass
+    except Exception:
+        # Graceful fallback - existing SourceIPAdapter will still work
+        # 优雅降级 - 现有的 SourceIPAdapter 仍然有效
+        pass
 
 
 class Srun_Py:
@@ -329,6 +428,10 @@ class Srun_Py:
             'https': '',
         }
 
+        # 安装 Windows TUN 代理绕过（IP_UNICAST_IF）
+        # Install Windows TUN proxy bypass (IP_UNICAST_IF)
+        _install_tun_bypass(self.session)
+
         # 如果指定了 client_ip，绑定到该源地址
         # If client_ip is specified, bind to that source address
         if self.client_ip:
@@ -336,16 +439,7 @@ class Srun_Py:
             self.session.mount('http://', adapter)
             self.session.mount('https://', adapter)
         else:
-            # 自动检测物理网卡 IP 并绑定，绕过 TUN 接口
-            # Auto-detect physical NIC IP and bind, bypassing TUN interface
-            detected_ip = _detect_physical_interface_ip()
-            if detected_ip:
-                self.detected_ip = detected_ip
-                adapter = SourceIPAdapter(detected_ip)
-                self.session.mount('http://', adapter)
-                self.session.mount('https://', adapter)
-            else:
-                self.detected_ip = None
+            self.detected_ip = None
 
     def _make_request(self, method: str, url: str, fallback_url: str,
                       use_ip_fallback: bool = True, **kwargs) -> requests.Response:

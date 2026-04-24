@@ -76,8 +76,17 @@ def is_domain(address: str) -> Tuple[bool, str]:
 # Global instances / 全局实例
 sysToaster = ToastNotifier()
 current_pid = os.getpid()
-application_path = os.path.abspath(sys.argv[0])
-python_path = os.path.abspath(sys.executable)
+
+# PyInstaller frozen mode detection
+_is_frozen = getattr(sys, 'frozen', False)
+if _is_frozen:
+    # PyInstaller: sys.executable points to the real exe
+    application_path = os.path.abspath(sys.executable)
+    python_path = application_path
+else:
+    application_path = os.path.abspath(sys.argv[0])
+    python_path = os.path.abspath(sys.executable)
+
 start_lnk_path = os.path.join(
     os.path.expandvars(r'%APPDATA%'),
     r'Microsoft\Windows\Start Menu\Programs\Startup',
@@ -172,10 +181,10 @@ def load_config(aes_key: str) -> Dict[str, Any]:
             "local_ips": [],
             "active_ip": None,
         }
-        with open(config_path, 'w') as f:
+        with open(config_path, 'w', encoding='utf-8') as f:
             f.write(json.dumps(config, indent=4, ensure_ascii=True))
     else:
-        with open(config_path, 'r') as f:
+        with open(config_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
         if config['password'] != "":
             config['password'] = aes.decode_aes(config['password'].encode())
@@ -208,7 +217,7 @@ def save_config(config: Dict[str, Any], aes_key: str) -> None:
     """
     aes = MyAES(key=aes_key)
     config['password'] = aes.encode_aes(config['password']).decode()
-    with open(config_path, 'w') as f:
+    with open(config_path, 'w', encoding='utf-8') as f:
         f.write(json.dumps(config, indent=4, ensure_ascii=True))
     config['password'] = aes.decode_aes(config['password'].encode())
 
@@ -241,27 +250,35 @@ def create_desktop_lnk(qt_backend: bool = False) -> None:
     Args / 参数:
         qt_backend: Whether using Qt backend / 是否使用 Qt 后端
     """
+    desktop_lnk = os.path.join(
+        os.path.expandvars(r'%USERPROFILE%'),
+        'Desktop', '校园网登陆器.lnk'
+    )
+    if os.path.exists(desktop_lnk):
+        os.remove(desktop_lnk)
+    shell = client.Dispatch('Wscript.Shell')
+    link = shell.CreateShortCut(desktop_lnk)
+
     no_cmd_path = os.path.join(
         os.path.dirname(application_path), 'srunpy-gui.exe'
     )
-    if (python_path != application_path and os.path.exists(python_path) and
+
+    if _is_frozen:
+        # PyInstaller frozen mode: shortcut to the exe directly
+        link.TargetPath = application_path
+        link.IconLocation = application_path + ',0'
+    elif (python_path != application_path and os.path.exists(python_path) and
             os.path.basename(application_path).endswith(".exe") and
             os.path.exists(no_cmd_path)):
-        desktop_lnk = os.path.join(
-            os.path.expandvars(r'%USERPROFILE%'),
-            'Desktop', '校园网登陆器.lnk'
-        )
-        if os.path.exists(desktop_lnk):
-            os.remove(desktop_lnk)
-        shell = client.Dispatch('Wscript.Shell')
-        link = shell.CreateShortCut(desktop_lnk)
         link.TargetPath = no_cmd_path
         if qt_backend:
             link.Arguments += ' --qt'
         link.IconLocation = os.path.join(WebRoot, 'icons/logo.ico') + ',0'
-        link.save()
     else:
         print("非EntryPoint启动，无法创建桌面快捷方式")
+        return
+
+    link.save()
 
 
 def create_lnk(qt_backend: bool = False) -> None:

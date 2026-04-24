@@ -10,6 +10,7 @@ Modified from: https://github.com/iskoldt-X/SRUN-authenticator
 import hashlib
 import hmac
 import json
+import logging
 import math
 import os
 import re
@@ -17,7 +18,6 @@ import socket
 import time
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
-import warnings
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -25,27 +25,37 @@ from urllib3.poolmanager import PoolManager
 import urllib3
 
 # Suppress InsecureRequestWarning globally (TUN mode uses IP fallback with verify=False)
-# 全局禁用 InsecureRequestWarning（TUN 模式下 IP 回退需要 verify=False）
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# === 日志配置 ===
+# Log to both file and console
+logger = logging.getLogger('SRunPy')
+logger.setLevel(logging.DEBUG)
+
+# Console handler (INFO level)
+_ch = logging.StreamHandler()
+_ch.setLevel(logging.INFO)
+_ch.setFormatter(logging.Formatter('[%(asctime)s] %(message)s', datefmt='%H:%M:%S'))
+logger.addHandler(_ch)
+
+# File handler (DEBUG level) - logs to srunpy.log in the same directory as the script
+_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'srunpy.log')
+_fh = logging.FileHandler(_log_path, encoding='utf-8')
+_fh.setLevel(logging.DEBUG)
+_fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+logger.addHandler(_fh)
+
+logger.info(f'日志文件: {_log_path}')
 
 
 def get_md5(password: str, token: str) -> str:
-    """
-    Generate MD5 hash with HMAC for password.
-    使用 HMAC 为密码生成 MD5 哈希。
-    """
     return hmac.new(token.encode(), password.encode(), hashlib.md5).hexdigest()
 
 def get_sha1(value: str) -> str:
-    """
-    Generate SHA1 hash for a string value.
-    为字符串值生成 SHA1 哈希。
-    """
     return hashlib.sha1(value.encode()).hexdigest()
 
 
 def force(msg: str) -> bytes:
-    """Convert string to bytes array (unused utility function)."""
     ret = []
     for w in msg:
         ret.append(ord(w))
@@ -53,14 +63,12 @@ def force(msg: str) -> bytes:
 
 
 def ordat(msg: str, idx: int) -> int:
-    """Get character code at index, return 0 if out of bounds."""
     if len(msg) > idx:
         return ord(msg[idx])
     return 0
 
 
 def sencode(msg: str, key: bool) -> List[int]:
-    """Encode string to integer array (Srun encoding algorithm)."""
     l = len(msg)
     pwd = []
     for i in range(0, l, 4):
@@ -73,7 +81,6 @@ def sencode(msg: str, key: bool) -> List[int]:
 
 
 def lencode(msg: List[int], key: bool) -> Optional[str]:
-    """Convert integer array back to string (Srun decoding algorithm)."""
     l = len(msg)
     ll = (l - 1) << 2
     if key:
@@ -90,7 +97,6 @@ def lencode(msg: List[int], key: bool) -> Optional[str]:
 
 
 def get_xencode(msg: str, key: str) -> str:
-    """Apply Srun XEncode encryption algorithm."""
     if msg == "":
         return ""
     pwd = sencode(msg, True)
@@ -129,8 +135,6 @@ def get_xencode(msg: str, key: str) -> str:
 
 
 class SourceIPAdapter(HTTPAdapter):
-    """HTTP Adapter for binding requests to a specific source IP address."""
-
     def __init__(self, source_ip: str, **kwargs):
         self.source_address = (source_ip, 0)
         super().__init__(**kwargs)
@@ -150,13 +154,12 @@ class SourceIPAdapter(HTTPAdapter):
 class Srun_Py:
     """
     Srun Gateway Authentication Client.
-    深澜网关认证客户端。
 
-    TUN 代理适配说明：
+    TUN 代理适配：
     - trust_env=False: 不读取系统代理环境变量
     - session.proxies 清空: 不走应用层代理
-    - _make_request: 4 级回退（域名HTTPS → IP HTTPS → 域名HTTP → IP HTTP）
-    - InsecureRequestWarning 已全局禁用（IP 回退时 SSL 证书不匹配不会刷屏）
+    - _make_request: 先尝试域名，失败后立即切 IP（短超时），避免 TUN 下长时间等待
+    - InsecureRequestWarning 已全局禁用
     """
 
     def __init__(self, srun_host: str = 'gw.imust.edu.cn',
@@ -185,60 +188,97 @@ class Srun_Py:
         self.client_ip = client_ip
         self.session = requests.Session()
 
-        # === TUN 代理适配 ===
-        # 不读取系统代理环境变量（HTTP_PROXY / HTTPS_PROXY / ALL_PROXY）
+        # TUN 代理适配
         self.session.trust_env = False
-        # 清空 session 级别代理设置
         self.session.proxies = {'http': '', 'https': ''}
 
-        # 如果指定了 client_ip，绑定到该源地址
+        # 智能路由：检测域名是否可达，决定后续请求策略
+        self._domain_ok = None  # None=未检测, True=域名可达, False=需要走IP
+
         if self.client_ip:
             adapter = SourceIPAdapter(self.client_ip)
             self.session.mount('http://', adapter)
             self.session.mount('https://', adapter)
 
+        logger.info(f'初始化完成: srun_host={srun_host}, host_ip={host_ip}, client_ip={client_ip}')
+
+    def _detect_domain(self) -> bool:
+        """
+        快速检测域名是否可达（2秒超时）。
+        检测一次后缓存结果，后续请求直接跳过不可达的域名。
+        """
+        if self._domain_ok is not None:
+            return self._domain_ok
+
+        logger.debug(f'检测域名可达性: {self.srun_host}')
+        t0 = time.time()
+        try:
+            resp = self.session.get(
+                self.get_ip_api,
+                timeout=(2, 3),
+                verify=False
+            )
+            elapsed = time.time() - t0
+            self._domain_ok = True
+            logger.debug(f'域名可达 ({elapsed:.1f}s): {self.srun_host}')
+            return True
+        except Exception as e:
+            elapsed = time.time() - t0
+            self._domain_ok = False
+            logger.debug(f'域名不可达 ({elapsed:.1f}s): {self.srun_host} -> {type(e).__name__}')
+            return False
+
     def _make_request(self, method: str, url: str, fallback_url: str,
                       use_ip_fallback: bool = True, **kwargs) -> requests.Response:
         """
-        发送 HTTP 请求，自动适配 TUN 代理环境。
-        4 级回退：域名HTTPS → IP HTTPS → 域名HTTP → IP HTTP
+        智能 HTTP 请求，自动适配 TUN 代理。
+        - 域名可达时：直接走域名（快）
+        - 域名不可达时：直接走 IP（快），跳过超时等待
         """
-        kwargs.setdefault('timeout', (3, 10))
-        last_error = None
+        # 域名首次检测
+        domain_ok = self._detect_domain()
 
-        # 尝试1: 域名 URL + HTTPS
-        try:
-            return self.session.request(method, url, **kwargs)
-        except Exception as e:
-            last_error = e
-
-        if use_ip_fallback:
-            # 尝试2: IP URL + HTTPS（证书不匹配，verify=False）
+        if domain_ok:
+            # 域名可达，直接走域名 HTTPS
+            kwargs.setdefault('timeout', (3, 10))
+            logger.debug(f'请求(域名): {method} {url[:80]}...')
+            t0 = time.time()
             try:
-                kwargs_fallback = {**kwargs, 'verify': False}
-                return self.session.request(method, fallback_url, **kwargs_fallback)
+                resp = self.session.request(method, url, **kwargs)
+                logger.debug(f'请求成功 ({time.time()-t0:.1f}s)')
+                return resp
             except Exception as e:
-                last_error = e
+                logger.debug(f'域名请求失败 ({time.time()-t0:.1f}s): {type(e).__name__}')
+                # 域名突然不可达，清除缓存，回退到 IP
+                self._domain_ok = False
 
-        # 尝试3: 域名 URL + HTTP
-        try:
-            url_http = url.replace('https://', 'http://', 1)
-            return self.session.request(method, url_http, **kwargs)
-        except Exception as e:
-            last_error = e
-
+        # 域名不可达，直接走 IP（短超时，快速失败）
         if use_ip_fallback:
-            # 尝试4: IP URL + HTTP
+            # IP HTTPS（短超时）
+            kwargs_ip = {**kwargs, 'verify': False, 'timeout': (2, 5)}
+            logger.debug(f'请求(IP HTTPS): {method} {fallback_url[:80]}...')
+            t0 = time.time()
             try:
-                fallback_url_http = fallback_url.replace('https://', 'http://', 1)
-                return self.session.request(method, fallback_url_http, **kwargs)
+                resp = self.session.request(method, fallback_url, **kwargs_ip)
+                logger.debug(f'请求成功 ({time.time()-t0:.1f}s)')
+                return resp
             except Exception as e:
-                last_error = e
+                logger.debug(f'IP HTTPS 失败 ({time.time()-t0:.1f}s): {type(e).__name__}')
 
-        raise last_error
+            # IP HTTP（短超时）
+            fallback_url_http = fallback_url.replace('https://', 'http://', 1)
+            logger.debug(f'请求(IP HTTP): {method} {fallback_url_http[:80]}...')
+            t0 = time.time()
+            try:
+                resp = self.session.request(method, fallback_url_http, **kwargs_ip)
+                logger.debug(f'请求成功 ({time.time()-t0:.1f}s)')
+                return resp
+            except Exception as e:
+                logger.debug(f'IP HTTP 失败 ({time.time()-t0:.1f}s): {type(e).__name__}')
+
+        raise ConnectionError(f'所有请求方式均失败: {url}')
 
     def get_base64(self, s: str) -> str:
-        """Custom base64 encoding using Srun's alphabet."""
         r = []
         x = len(s) % 3
         if x:
@@ -259,7 +299,6 @@ class Srun_Py:
 
     def get_chksum(self, username: str, token: str, hmd5: str,
                    ip: str, i: str) -> str:
-        """Generate checksum for authentication."""
         chkstr = token + username
         chkstr += token + hmd5
         chkstr += token + self.ac_id
@@ -270,7 +309,6 @@ class Srun_Py:
         return chkstr
 
     def get_info(self, username: str, password: str, ip: str) -> str:
-        """Build info string for authentication."""
         info_temp = {
             "username": username,
             "password": password,
@@ -283,20 +321,18 @@ class Srun_Py:
         return i
 
     def init_getip(self) -> Tuple[str, Optional[str]]:
-        """Get current IP and username from gateway."""
+        logger.debug('获取本机 IP...')
         res = self._make_request('GET', self.get_ip_api, self.get_ip_api_ip)
         data = json.loads(res.text[res.text.find('(') + 1:-1])
         ip = data.get('client_ip') or data.get('online_ip')
         username = data.get('user_name')
+        logger.debug(f'本机 IP: {ip}, 用户名: {username}')
         return ip, username
 
     def get_token(self, username: str, ip: str) -> str:
-        """Get authentication token from gateway."""
+        logger.debug(f'获取 token: username={username}, ip={ip}')
         get_challenge_params = {
-            "callback": (
-                "jQuery112404953340710317169_" +
-                str(int(time.time() * 1000))
-            ),
+            "callback": "jQuery112404953340710317169_" + str(int(time.time() * 1000)),
             "username": username,
             "ip": ip,
             "_": int(time.time() * 1000),
@@ -306,23 +342,26 @@ class Srun_Py:
             params=get_challenge_params, headers=self.header
         )
         token = re.search('"challenge":"(.*?)"', get_challenge_res.text).group(1)
+        logger.debug(f'Token: {token[:16]}...')
         return token
 
     def is_connected(self) -> Tuple[bool, bool, Optional[Dict]]:
-        """Check if the client is connected to the gateway."""
+        logger.debug('检查在线状态...')
         try:
             res = self._make_request('GET', self.get_ip_api, self.get_ip_api_ip)
             data = json.loads(res.text[res.text.find('(') + 1:-1])
             if 'error' in data and data['error'] == 'not_online_error':
+                logger.debug('状态: 未在线')
                 return True, False, data
             else:
+                logger.debug(f'状态: 已在线 (user={data.get("user_name","?")})')
                 return True, True, data
-        except Exception:
+        except Exception as e:
+            logger.debug(f'状态检查失败: {e}')
             return False, False, None
 
     def do_complex_work(self, username: str, password: str,
                         ip: str, token: str) -> Tuple[str, str, str]:
-        """Perform complex authentication work (encoding and hashing)."""
         i = self.get_info(username, password, ip)
         i = "{SRBX1}" + self.get_base64(get_xencode(i, token))
         hmd5 = get_md5(password, token)
@@ -330,7 +369,6 @@ class Srun_Py:
         return i, hmd5, chksum
 
     def _parse_portal_payload(self, raw: str) -> Dict:
-        """Parse raw portal response (JSON or JSONP) into a dictionary."""
         text = (raw or '').strip()
         if not text:
             return {}
@@ -349,7 +387,7 @@ class Srun_Py:
         return {}
 
     def update_acid(self) -> None:
-        """Update AC ID from gateway redirect URL."""
+        logger.debug('更新 ac_id...')
         response = self.session.get(
             url=self.init_url.replace('https', 'http', 1),
             allow_redirects=True, timeout=(3, 10)
@@ -358,16 +396,24 @@ class Srun_Py:
         query_params = parse_qs(parsed_url.query)
         if 'ac_id' in query_params and len(query_params['ac_id']) > 0:
             self.ac_id = query_params['ac_id'][0]
+            logger.debug(f'ac_id 更新为: {self.ac_id}')
 
     def login(self, username: str, password: str) -> bool:
-        """Login to the gateway."""
+        t_start = time.time()
+        logger.info(f'开始登录: {username}')
+
         is_available, is_online, _ = self.is_connected()
         if not is_available or is_online:
-            raise Exception('You are already online or the network is not available!')
+            msg = '已在线或网络不可用' if is_online else '网络不可用'
+            logger.error(f'登录失败: {msg}')
+            raise Exception(f'You are already online or the network is not available!')
+
         self.update_acid()
         ip, _ = self.init_getip()
         token = self.get_token(username, ip)
         i, hmd5, chksum = self.do_complex_work(username, password, ip, token)
+
+        logger.debug('发送登录请求...')
         srun_portal_params = {
             'callback': 'jQuery11240645308969735664_' + str(int(time.time() * 1000)),
             'action': 'login',
@@ -390,9 +436,18 @@ class Srun_Py:
         )
         srun_portal_res = srun_portal_res.text
         data = json.loads(srun_portal_res[srun_portal_res.find('(') + 1:-1])
+
+        elapsed = time.time() - t_start
+        if data.get('error') == 'ok':
+            logger.info(f'登录成功! (耗时 {elapsed:.1f}s)')
+        else:
+            logger.error(f'登录失败: {data.get("error")} - {data.get("error_msg", "")} (耗时 {elapsed:.1f}s)')
         return data.get('error') == 'ok'
 
     def logout(self) -> bool:
+        t_start = time.time()
+        logger.info('开始注销...')
+
         is_available, is_online, _ = self.is_connected()
         if not is_available or not is_online:
             raise Exception('You are not online or the network is not available!')
@@ -429,14 +484,21 @@ class Srun_Py:
             msg_code in {'ok', 'logout_ok'} or
             raw_res.strip().lower() in {'ok', 'logout_ok'}
         ):
+            elapsed = time.time() - t_start
+            logger.info(f'注销成功! (耗时 {elapsed:.1f}s)')
             return True
 
+        logger.debug('Portal 注销未成功，尝试 DM 注销...')
         dm_res = self.logout_classic()
         dm_text = dm_res.strip().lower()
+        elapsed = time.time() - t_start
+        if dm_text in {'ok', 'logout_ok', 'success', '1', 'true'}:
+            logger.info(f'注销成功 (DM)! (耗时 {elapsed:.1f}s)')
+        else:
+            logger.error(f'注销失败: {dm_text} (耗时 {elapsed:.1f}s)')
         return dm_text in {'ok', 'logout_ok', 'success', '1', 'true'}
 
     def logout_classic(self) -> str:
-        """Logout from the gateway using DM-style."""
         ip, username = self.init_getip()
         t = int(time.time() * 1000)
         sign = get_sha1(str(t) + username + ip + '0' + str(t))

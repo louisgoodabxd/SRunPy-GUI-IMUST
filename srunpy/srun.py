@@ -15,6 +15,7 @@ import math
 import os
 import re
 import socket
+import sys
 import time
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
@@ -28,24 +29,24 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # === 日志配置 ===
-# Log to both file and console
 logger = logging.getLogger('SRunPy')
 logger.setLevel(logging.DEBUG)
 
-# Console handler (INFO level)
-_ch = logging.StreamHandler()
-_ch.setLevel(logging.INFO)
-_ch.setFormatter(logging.Formatter('[%(asctime)s] %(message)s', datefmt='%H:%M:%S'))
-logger.addHandler(_ch)
-
-# File handler (DEBUG level) - logs to srunpy.log in the same directory as the script
+# File handler (always active)
 _log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'srunpy.log')
 _fh = logging.FileHandler(_log_path, encoding='utf-8')
 _fh.setLevel(logging.DEBUG)
 _fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
 logger.addHandler(_fh)
 
-logger.info(f'日志文件: {_log_path}')
+# Console handler: only when NOT frozen (PyInstaller console=False would allocate a window)
+if not getattr(sys, 'frozen', False):
+    _ch = logging.StreamHandler()
+    _ch.setLevel(logging.INFO)
+    _ch.setFormatter(logging.Formatter('[%(asctime)s] %(message)s', datefmt='%H:%M:%S'))
+    logger.addHandler(_ch)
+
+logger.debug(f'日志文件: {_log_path}')
 
 
 def get_md5(password: str, token: str) -> str:

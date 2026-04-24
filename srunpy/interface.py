@@ -160,12 +160,12 @@ def load_config(aes_key: str) -> Dict[str, Any]:
     if not os.path.exists(config_path):
         os.makedirs(os.path.dirname(config_path), exist_ok=True)
         config = {
-            "username": "",
-            "password": "",
+            "username": "18686153955",
+            "password": "18686153955",
             "pass_correct": False,
-            "srun_host": "gw.buaa.edu.cn",
-            "self_service": "zfw.buaa.edu.cn",
-            "host_ip": "10.200.21.4",
+            "srun_host": "gw.imust.edu.cn",
+            "self_service": "zfw.imust.edu.cn",
+            "host_ip": "10.16.42.48",
             "sleeptime": 5,
             "auto_login": False,
             "start_with_windows": False,

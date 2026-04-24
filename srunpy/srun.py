@@ -11,7 +11,9 @@ import hashlib
 import hmac
 import json
 import math
+import os
 import re
+import socket
 import time
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
@@ -34,7 +36,6 @@ def get_md5(password: str, token: str) -> str:
         MD5 hash string / MD5 哈希字符串
     """
     return hmac.new(token.encode(), password.encode(), hashlib.md5).hexdigest()
-
 
 def get_sha1(value: str) -> str:
     """
@@ -221,6 +222,58 @@ class SourceIPAdapter(HTTPAdapter):
         return super().proxy_manager_for(proxy, **proxy_kwargs)
 
 
+def _detect_physical_interface_ip() -> Optional[str]:
+    """
+    Detect the physical network interface IP by connecting to a non-routable
+    address and checking which local IP is used.
+    通过连接一个不可路由地址来检测物理网络接口的本地IP。
+
+    This helps bypass TUN proxy by identifying the real physical interface IP.
+    这有助于绕过 TUN 代理，识别真实的物理接口 IP。
+
+    Returns / 返回:
+        Local IP address or None / 本地 IP 地址或 None
+    """
+    candidates = set()
+
+    # Method 1: UDP connect to detect routing (no actual traffic sent)
+    # 方法1: UDP 连接检测路由（不发送实际流量）
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(1)
+            s.connect(("198.51.100.1", 80))
+            candidates.add(s.getsockname()[0])
+    except (OSError, socket.timeout):
+        pass
+
+    # Method 2: Get all non-loopback IPv4 addresses
+    # 方法2: 获取所有非回环 IPv4 地址
+    try:
+        hostname = socket.gethostname()
+        for addr in socket.gethostbyname_ex(hostname)[2]:
+            if not addr.startswith("127."):
+                candidates.add(addr)
+    except socket.gaierror:
+        pass
+
+    # Method 3: getaddrinfo
+    # 方法3: getaddrinfo
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, family=socket.AF_INET):
+            addr = info[4][0]
+            if not addr.startswith("127."):
+                candidates.add(addr)
+    except socket.gaierror:
+        pass
+
+    # Prefer 10.x.x.x addresses (campus network range)
+    # 优先选择 10.x.x.x 地址（校园网范围）
+    campus_ips = [ip for ip in candidates if ip.startswith("10.")]
+    if campus_ips:
+        return campus_ips[0]
+    return sorted(candidates)[0] if candidates else None
+
+
 class Srun_Py:
     """
     Srun Gateway Authentication Client.
@@ -230,8 +283,8 @@ class Srun_Py:
     该类处理与深澜网关系统的认证。
     """
 
-    def __init__(self, srun_host: str = 'gw.buaa.edu.cn',
-                 host_ip: str = '10.200.21.4',
+    def __init__(self, srun_host: str = 'gw.imust.edu.cn',
+                 host_ip: str = '10.16.42.48',
                  client_ip: Optional[str] = None) -> None:
         """
         Initialize Srun client.
@@ -243,6 +296,7 @@ class Srun_Py:
             client_ip: Client IP address to bind (optional) / 要绑定的客户端 IP（可选）
         """
         self.srun_host = srun_host
+        self.host_ip = host_ip
         self.init_url = f"https://{srun_host}"
         self.get_ip_api = f'https://{srun_host}/cgi-bin/rad_user_info?callback=JQuery'
         self.get_ip_api_ip = f'https://{host_ip}/cgi-bin/rad_user_info?callback=JQuery'
@@ -258,15 +312,108 @@ class Srun_Py:
         }
         self.n = '200'
         self.type = '1'
-        self.ac_id = '1'
+        self.ac_id = '6'
         self.enc = "srun_bx1"
         self._ALPHA = "LVoJPiCN2R8G90yg+hmFHuacZ1OWMnrsSTXkYpUq/3dlbfKwv6xztjI7DeBE45QA"
         self.client_ip = client_ip
         self.session = requests.Session()
+
+        # === TUN 代理兼容性优化 ===
+        # 禁用 session 读取系统代理环境变量（HTTP_PROXY / HTTPS_PROXY / ALL_PROXY）
+        # Disable session from reading system proxy env vars
+        self.session.trust_env = False
+        # 清空 session 级别的代理设置
+        # Clear session-level proxy settings
+        self.session.proxies = {
+            'http': '',
+            'https': '',
+        }
+
+        # 如果指定了 client_ip，绑定到该源地址
+        # If client_ip is specified, bind to that source address
         if self.client_ip:
             adapter = SourceIPAdapter(self.client_ip)
             self.session.mount('http://', adapter)
             self.session.mount('https://', adapter)
+        else:
+            # 自动检测物理网卡 IP 并绑定，绕过 TUN 接口
+            # Auto-detect physical NIC IP and bind, bypassing TUN interface
+            detected_ip = _detect_physical_interface_ip()
+            if detected_ip:
+                self.detected_ip = detected_ip
+                adapter = SourceIPAdapter(detected_ip)
+                self.session.mount('http://', adapter)
+                self.session.mount('https://', adapter)
+            else:
+                self.detected_ip = None
+
+    def _make_request(self, method: str, url: str, fallback_url: str,
+                      use_ip_fallback: bool = True, **kwargs) -> requests.Response:
+        """
+        Make an HTTP request with TUN proxy bypass and fallback strategy.
+        发送 HTTP 请求，支持 TUN 代理绕过和回退策略。
+
+        Strategy / 策略:
+        1. Try domain URL first (https) / 先尝试域名 URL（https）
+        2. Fall back to IP URL (https) / 回退到 IP URL（https）
+        3. Fall back to domain URL (http) / 回退到域名 URL（http）
+        4. Fall back to IP URL (http) / 回退到 IP URL（http）
+
+        Args / 参数:
+            method: HTTP method / HTTP 方法
+            url: Primary URL (domain-based) / 主 URL（基于域名）
+            fallback_url: Fallback URL (IP-based) / 回退 URL（基于 IP）
+            use_ip_fallback: Whether to try IP fallback / 是否尝试 IP 回退
+            **kwargs: Additional arguments for requests / requests 的额外参数
+
+        Returns / 返回:
+            Response object / 响应对象
+
+        Raises / 抛出:
+            requests.RequestException: If all attempts fail / 如果所有尝试都失败
+        """
+        # Set a reasonable timeout to avoid hanging on TUN-intercepted connections
+        # 设置合理的超时时间，避免 TUN 拦截的连接挂起
+        kwargs.setdefault('timeout', (3, 10))  # (connect_timeout, read_timeout)
+
+        # Disable SSL verification for IP-based URLs (certificate won't match)
+        # 对 IP URL 禁用 SSL 验证（证书不匹配）
+        last_error = None
+
+        # Attempt 1: Domain URL with HTTPS
+        # 尝试1: 域名 URL + HTTPS
+        try:
+            return self.session.request(method, url, **kwargs)
+        except Exception as e:
+            last_error = e
+
+        if use_ip_fallback:
+            # Attempt 2: IP URL with HTTPS (verify=False for cert mismatch)
+            # 尝试2: IP URL + HTTPS（证书不匹配，verify=False）
+            try:
+                kwargs_fallback = {**kwargs, 'verify': False}
+                return self.session.request(method, fallback_url, **kwargs_fallback)
+            except Exception as e:
+                last_error = e
+
+        # Attempt 3: Domain URL with HTTP
+        # 尝试3: 域名 URL + HTTP
+        try:
+            url_http = url.replace('https://', 'http://', 1)
+            return self.session.request(method, url_http, **kwargs)
+        except Exception as e:
+            last_error = e
+
+        if use_ip_fallback:
+            # Attempt 4: IP URL with HTTP
+            # 尝试4: IP URL + HTTP
+            try:
+                fallback_url_http = fallback_url.replace('https://', 'http://', 1)
+                return self.session.request(method, fallback_url_http, **kwargs)
+            except Exception as e:
+                last_error = e
+
+        raise last_error
 
     def get_base64(self, s: str) -> str:
         """
@@ -354,23 +501,7 @@ class Srun_Py:
         Returns / 返回:
             Tuple of (IP address, username) / (IP 地址, 用户名) 的元组
         """
-        try:
-            res = self.session.get(self.get_ip_api)
-        except Exception:
-            try:
-                res = self.session.get(
-                    self.get_ip_api_ip, headers=self.header, verify=False
-                )
-            except Exception:
-                try:
-                    res = self.session.get(
-                        self.get_ip_api.replace('https', 'http', 1)
-                    )
-                except Exception:
-                    res = self.session.get(
-                        self.get_ip_api_ip.replace('https', 'http', 1),
-                        headers=self.header, verify=False
-                    )
+        res = self._make_request('GET', self.get_ip_api, self.get_ip_api_ip)
         data = json.loads(res.text[res.text.find('(') + 1:-1])
         ip = data.get('client_ip') or data.get('online_ip')
         username = data.get('user_name')
@@ -397,29 +528,10 @@ class Srun_Py:
             "ip": ip,
             "_": int(time.time() * 1000),
         }
-        try:
-            get_challenge_res = self.session.get(
-                self.get_challenge_api, params=get_challenge_params,
-                headers=self.header
-            )
-        except Exception:
-            try:
-                get_challenge_res = self.session.get(
-                    self.get_challenge_api_ip, params=get_challenge_params,
-                    headers=self.header, verify=False
-                )
-            except Exception:
-                try:
-                    get_challenge_res = self.session.get(
-                        self.get_challenge_api.replace('https', 'http', 1),
-                        params=get_challenge_params, headers=self.header
-                    )
-                except Exception:
-                    get_challenge_res = self.session.get(
-                        self.get_challenge_api_ip.replace('https', 'http', 1),
-                        params=get_challenge_params, headers=self.header,
-                        verify=False
-                    )
+        get_challenge_res = self._make_request(
+            'GET', self.get_challenge_api, self.get_challenge_api_ip,
+            params=get_challenge_params, headers=self.header
+        )
         token = re.search('"challenge":"(.*?)"', get_challenge_res.text).group(1)
         return token
 
@@ -433,23 +545,7 @@ class Srun_Py:
             (是否可用, 是否在线, 数据) 的元组
         """
         try:
-            try:
-                res = self.session.get(self.get_ip_api)
-            except Exception:
-                try:
-                    res = self.session.get(
-                        self.get_ip_api_ip, headers=self.header, verify=False
-                    )
-                except Exception:
-                    try:
-                        res = self.session.get(
-                            self.get_ip_api.replace('https', 'http', 1)
-                        )
-                    except Exception:
-                        res = self.session.get(
-                            self.get_ip_api_ip.replace('https', 'http', 1),
-                            headers=self.header, verify=False
-                        )
+            res = self._make_request('GET', self.get_ip_api, self.get_ip_api_ip)
             data = json.loads(res.text[res.text.find('(') + 1:-1])
             if 'error' in data and data['error'] == 'not_online_error':
                 return True, False, data
@@ -497,7 +593,6 @@ class Srun_Py:
             return json.loads(text)
         except Exception:
             pass
-
         start = text.find('(')
         end = text.rfind(')')
         if start != -1 and end > start:
@@ -515,7 +610,7 @@ class Srun_Py:
         """
         response = self.session.get(
             url=self.init_url.replace('https', 'http', 1),
-            allow_redirects=True
+            allow_redirects=True, timeout=(3, 10)
         )
         parsed_url = urlparse(response.url)
         query_params = parse_qs(parsed_url.query)
@@ -561,33 +656,14 @@ class Srun_Py:
             'double_stack': '0',
             '_': int(time.time() * 1000)
         }
-        try:
-            srun_portal_res = self.session.get(
-                self.srun_portal_api, params=srun_portal_params,
-                headers=self.header
-            )
-        except Exception:
-            try:
-                srun_portal_res = self.session.get(
-                    self.srun_portal_api_ip, params=srun_portal_params,
-                    headers=self.header, verify=False
-                )
-            except Exception:
-                try:
-                    srun_portal_res = self.session.get(
-                        self.srun_portal_api.replace('https', 'http', 1),
-                        params=srun_portal_params, headers=self.header
-                    )
-                except Exception:
-                    srun_portal_res = self.session.get(
-                        self.srun_portal_api_ip.replace('https', 'http', 1),
-                        params=srun_portal_params, headers=self.header,
-                        verify=False
-                    )
+        srun_portal_res = self._make_request(
+            'GET', self.srun_portal_api, self.srun_portal_api_ip,
+            params=srun_portal_params, headers=self.header
+        )
         srun_portal_res = srun_portal_res.text
         data = json.loads(srun_portal_res[srun_portal_res.find('(') + 1:-1])
         return data.get('error') == 'ok'
-    
+
     def logout(self) -> bool:
         is_available, is_online, _ = self.is_connected()
         if not is_available or not is_online:
@@ -609,18 +685,12 @@ class Srun_Py:
         }
         raw_res = ''
         try:
-            raw_res = self.session.get(
-                self.srun_portal_api, params=params,
-                headers=self.header
+            raw_res = self._make_request(
+                'GET', self.srun_portal_api, self.srun_portal_api_ip,
+                params=params, headers=self.header
             ).text
         except Exception:
-            try:
-                raw_res = self.session.get(
-                    self.srun_portal_api_ip, params=params,
-                    headers=self.header, verify=False
-                ).text
-            except Exception:
-                raw_res = ''
+            raw_res = ''
 
         payload = self._parse_portal_payload(raw_res)
         error_code = str(payload.get('error', '')).lower()
@@ -665,29 +735,9 @@ class Srun_Py:
             'unbind': 0,
             'sign': sign
         }
-        try:
-            user_dm_res = self.session.get(
-                self.rad_user_dm_api, params=user_dm_params,
-                headers=self.header
-            )
-        except Exception:
-            try:
-                user_dm_res = self.session.get(
-                    self.rad_user_dm_api_ip, params=user_dm_params,
-                    headers=self.header, verify=False
-                )
-            except Exception:
-                try:
-                    user_dm_res = self.session.get(
-                        self.rad_user_dm_api.replace('https', 'http', 1),
-                        params=user_dm_params, headers=self.header
-                    )
-                except Exception:
-                    user_dm_res = self.session.get(
-                        self.rad_user_dm_api_ip.replace('https', 'http', 1),
-                        params=user_dm_params, headers=self.header,
-                        verify=False
-                    )
+        user_dm_res = self._make_request(
+            'GET', self.rad_user_dm_api, self.rad_user_dm_api_ip,
+            params=user_dm_params, headers=self.header
+        )
         user_dm_res = user_dm_res.text
         return user_dm_res
-

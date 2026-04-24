@@ -173,7 +173,7 @@ def load_config(aes_key: str) -> Dict[str, Any]:
             "password": "18686153955",
             "pass_correct": False,
             "srun_host": "gw.imust.edu.cn",
-            "self_service": "zfw.imust.edu.cn",
+            "self_service": "gw.imust.edu.cn:8800",
             "host_ip": "10.16.42.48",
             "sleeptime": 5,
             "auto_login": False,

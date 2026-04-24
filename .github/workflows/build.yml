@@ -25,7 +25,7 @@ jobs:
 
       - name: Generate encrypted entry file
         shell: python
-        run:
+        run: |
           import random, string, os
           aes_key = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
           os.makedirs('build_output', exist_ok=True)

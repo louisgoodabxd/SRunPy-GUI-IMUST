@@ -351,7 +351,7 @@ def Build() -> None:
         )
         pyinstaller_args.extend([
             '--onefile',
-            '--console',
+            '--windowed',
             '--name', 'SRunClient',
             '--icon', icon_path,
             '--add-data', f'{html_dir};srunpy/html',

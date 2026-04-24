@@ -160,7 +160,11 @@ class Srun_Py:
     - session.proxies 清空: 不走应用层代理
     - _make_request: 先尝试域名，失败后立即切 IP（短超时），避免 TUN 下长时间等待
     - InsecureRequestWarning 已全局禁用
+    - _domain_ok 是类级别缓存，所有实例共享，只检测一次
     """
+
+    # 类级别域名可达性缓存（所有实例共享，只检测一次）
+    _domain_ok: Optional[bool] = None
 
     def __init__(self, srun_host: str = 'gw.imust.edu.cn',
                  host_ip: str = '10.16.42.48',
@@ -192,8 +196,7 @@ class Srun_Py:
         self.session.trust_env = False
         self.session.proxies = {'http': '', 'https': ''}
 
-        # 智能路由：检测域名是否可达，决定后续请求策略
-        self._domain_ok = None  # None=未检测, True=域名可达, False=需要走IP
+        # 智能路由：域名可达性由类级别缓存 _domain_ok 控制，所有实例共享
 
         if self.client_ip:
             adapter = SourceIPAdapter(self.client_ip)
@@ -219,12 +222,12 @@ class Srun_Py:
                 verify=False
             )
             elapsed = time.time() - t0
-            self._domain_ok = True
+            Srun_Py._domain_ok = True
             logger.debug(f'域名可达 ({elapsed:.1f}s): {self.srun_host}')
             return True
         except Exception as e:
             elapsed = time.time() - t0
-            self._domain_ok = False
+            Srun_Py._domain_ok = False
             logger.debug(f'域名不可达 ({elapsed:.1f}s): {self.srun_host} -> {type(e).__name__}')
             return False
 
@@ -250,7 +253,7 @@ class Srun_Py:
             except Exception as e:
                 logger.debug(f'域名请求失败 ({time.time()-t0:.1f}s): {type(e).__name__}')
                 # 域名突然不可达，清除缓存，回退到 IP
-                self._domain_ok = False
+                Srun_Py._domain_ok = False
 
         # 域名不可达，直接走 IP（短超时，快速失败）
         if use_ip_fallback:
@@ -385,13 +388,20 @@ class Srun_Py:
             except Exception:
                 return {}
         return {}
-
     def update_acid(self) -> None:
+        """Update AC ID from gateway redirect URL."""
         logger.debug('更新 ac_id...')
-        response = self.session.get(
-            url=self.init_url.replace('https', 'http', 1),
-            allow_redirects=True, timeout=(3, 10)
-        )
+        init_url_http = self.init_url.replace('https', 'http', 1)
+        init_url_ip = f"http://{self.host_ip}"
+        try:
+            response = self._make_request(
+                'GET', init_url_http, init_url_ip,
+                allow_redirects=True
+            )
+        except Exception:
+            # 如果都失败，用默认值
+            logger.debug('ac_id 更新失败，使用默认值')
+            return
         parsed_url = urlparse(response.url)
         query_params = parse_qs(parsed_url.query)
         if 'ac_id' in query_params and len(query_params['ac_id']) > 0:

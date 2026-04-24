@@ -439,10 +439,13 @@ class GUIBackend:
         self.refresh_config()
 
         if 'process_id' in self.config and self.config['process_id'] != current_pid:
-            subprocess.call(
-                "start /B taskkill /f /pid " + str(self.config['process_id']),
-                shell=True
-            )
+            try:
+                subprocess.call(
+                    "start /B taskkill /f /pid " + str(self.config['process_id']),
+                    shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+            except Exception:
+                pass
         if 'process_id' not in self.config:
             try:
                 create_desktop_lnk(qt_backend=self.qt_backend)

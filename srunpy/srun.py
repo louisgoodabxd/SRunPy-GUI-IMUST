@@ -14,28 +14,25 @@ import math
 import os
 import re
 import socket
-import struct
-import sys
 import time
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
+import warnings
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.poolmanager import PoolManager
+import urllib3
+
+# Suppress InsecureRequestWarning globally (TUN mode uses IP fallback with verify=False)
+# 全局禁用 InsecureRequestWarning（TUN 模式下 IP 回退需要 verify=False）
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 def get_md5(password: str, token: str) -> str:
     """
     Generate MD5 hash with HMAC for password.
     使用 HMAC 为密码生成 MD5 哈希。
-
-    Args / 参数:
-        password: User password / 用户密码
-        token: Authentication token / 认证令牌
-
-    Returns / 返回:
-        MD5 hash string / MD5 哈希字符串
     """
     return hmac.new(token.encode(), password.encode(), hashlib.md5).hexdigest()
 
@@ -43,27 +40,12 @@ def get_sha1(value: str) -> str:
     """
     Generate SHA1 hash for a string value.
     为字符串值生成 SHA1 哈希。
-
-    Args / 参数:
-        value: Input string / 输入字符串
-
-    Returns / 返回:
-        SHA1 hash string / SHA1 哈希字符串
     """
     return hashlib.sha1(value.encode()).hexdigest()
 
 
 def force(msg: str) -> bytes:
-    """
-    Convert string to bytes array (unused utility function).
-    将字符串转换为字节数组（未使用的工具函数）。
-
-    Args / 参数:
-        msg: Input string / 输入字符串
-
-    Returns / 返回:
-        Bytes representation / 字节表示
-    """
+    """Convert string to bytes array (unused utility function)."""
     ret = []
     for w in msg:
         ret.append(ord(w))
@@ -71,34 +53,14 @@ def force(msg: str) -> bytes:
 
 
 def ordat(msg: str, idx: int) -> int:
-    """
-    Get character code at index, return 0 if out of bounds.
-    获取索引处的字符代码，如果越界则返回 0。
-
-    Args / 参数:
-        msg: Input string / 输入字符串
-        idx: Index position / 索引位置
-
-    Returns / 返回:
-        Character code or 0 / 字符代码或 0
-    """
+    """Get character code at index, return 0 if out of bounds."""
     if len(msg) > idx:
         return ord(msg[idx])
     return 0
 
 
 def sencode(msg: str, key: bool) -> List[int]:
-    """
-    Encode string to integer array (Srun encoding algorithm).
-    将字符串编码为整数数组（深澜编码算法）。
-
-    Args / 参数:
-        msg: Message to encode / 要编码的消息
-        key: Whether to append length / 是否追加长度
-
-    Returns / 返回:
-        List of encoded integers / 编码整数列表
-    """
+    """Encode string to integer array (Srun encoding algorithm)."""
     l = len(msg)
     pwd = []
     for i in range(0, l, 4):
@@ -111,17 +73,7 @@ def sencode(msg: str, key: bool) -> List[int]:
 
 
 def lencode(msg: List[int], key: bool) -> Optional[str]:
-    """
-    Convert integer array back to string (Srun decoding algorithm).
-    将整数数组转换回字符串（深澜解码算法）。
-
-    Args / 参数:
-        msg: List of integers to decode / 要解码的整数列表
-        key: Whether length was appended / 是否追加了长度
-
-    Returns / 返回:
-        Decoded string or None / 解码的字符串或 None
-    """
+    """Convert integer array back to string (Srun decoding algorithm)."""
     l = len(msg)
     ll = (l - 1) << 2
     if key:
@@ -138,17 +90,7 @@ def lencode(msg: List[int], key: bool) -> Optional[str]:
 
 
 def get_xencode(msg: str, key: str) -> str:
-    """
-    Apply Srun XEncode encryption algorithm.
-    应用深澜 XEncode 加密算法。
-
-    Args / 参数:
-        msg: Message to encode / 要编码的消息
-        key: Encryption key / 加密密钥
-
-    Returns / 返回:
-        Encoded string / 编码后的字符串
-    """
+    """Apply Srun XEncode encryption algorithm."""
     if msg == "":
         return ""
     pwd = sencode(msg, True)
@@ -187,190 +129,22 @@ def get_xencode(msg: str, key: str) -> str:
 
 
 class SourceIPAdapter(HTTPAdapter):
-    """
-    HTTP Adapter for binding requests to a specific source IP address.
-    用于将请求绑定到特定源 IP 地址的 HTTP 适配器。
-    """
+    """HTTP Adapter for binding requests to a specific source IP address."""
 
     def __init__(self, source_ip: str, **kwargs):
-        """
-        Initialize the adapter with source IP.
-        使用源 IP 初始化适配器。
-
-        Args / 参数:
-            source_ip: Source IP address to bind / 要绑定的源 IP 地址
-            **kwargs: Additional arguments for HTTPAdapter / HTTPAdapter 的额外参数
-        """
         self.source_address = (source_ip, 0)
         super().__init__(**kwargs)
 
     def init_poolmanager(self, connections: int, maxsize: int,
                          block: bool = False, **pool_kwargs) -> None:
-        """
-        Initialize pool manager with source address.
-        使用源地址初始化池管理器。
-        """
         pool_kwargs["source_address"] = self.source_address
         self.poolmanager = PoolManager(
             num_pools=connections, maxsize=maxsize, block=block, **pool_kwargs
         )
 
     def proxy_manager_for(self, proxy: str, **proxy_kwargs):
-        """
-        Initialize proxy manager with source address.
-        使用源地址初始化代理管理器。
-        """
         proxy_kwargs["source_address"] = self.source_address
         return super().proxy_manager_for(proxy, **proxy_kwargs)
-
-
-def _get_physical_iface_index() -> Optional[int]:
-    """
-    Get the Windows network interface index for the physical (non-TUN) adapter.
-    通过 route print 获取物理网卡（非 TUN）的接口索引。
-
-    This is used to set IP_UNICAST_IF socket option, which forces traffic
-    through the physical interface, bypassing TUN proxy at the OS level.
-    用于设置 IP_UNICAST_IF socket 选项，强制流量走物理网卡，绕过 TUN 代理。
-
-    Returns / 返回:
-        Interface index or None / 接口索引或 None
-    """
-    if sys.platform != 'win32':
-        return None
-    try:
-        import subprocess
-        # Use route print to get interface list
-        # 使用 route print 获取接口列表
-        result = subprocess.run(
-            ['route', 'print'],
-            capture_output=True, text=True, timeout=5,
-            creationflags=0x08000000  # CREATE_NO_WINDOW
-        )
-
-        lines = result.stdout.split('\n')
-        in_iflist = False
-        physical_interfaces = []
-
-        # TUN/tunnel interface keywords to exclude
-        # 需要排除的 TUN/隧道接口关键词
-        tun_keywords = [
-            'clash', 'sing', 'v2ray', 'vless', 'tun', 'wintun',
-            'wireguard', 'tapor', 'loopback', 'isatap', 'teredo',
-            '6to4', 'wan miniport'
-        ]
-
-        for line in lines:
-            if 'Interface List' in line:
-                in_iflist = True
-                continue
-            if in_iflist:
-                line_stripped = line.strip()
-                if not line_stripped or line_stripped.startswith('==='):
-                    break
-                # Format: "  13...xx xx xx xx xx xx  ...Ethernet"
-                # 格式: "  13...xx xx xx xx xx xx  ...以太网"
-                parts = line_stripped.split('...')
-                if len(parts) >= 2:
-                    try:
-                        idx = int(parts[0].strip())
-                        name = parts[-1].strip().lower()
-                        if not any(kw in name for kw in tun_keywords):
-                            physical_interfaces.append(idx)
-                    except (ValueError, IndexError):
-                        pass
-
-        return physical_interfaces[0] if physical_interfaces else None
-    except Exception:
-        return None
-
-
-def _install_tun_bypass(session: requests.Session) -> None:
-    """
-    Install TUN proxy bypass by patching urllib3's socket creation.
-    通过修补 urllib3 的 socket 创建来安装 TUN 代理绕过。
-
-    On Windows, sets IP_UNICAST_IF socket option to force traffic through
-    the physical network interface, bypassing TUN virtual adapter.
-    在 Windows 上设置 IP_UNICAST_IF socket 选项，强制流量走物理网卡，
-    绕过 TUN 虚拟适配器。
-
-    Args / 参数:
-        session: The requests session to patch / 要修补的 requests session
-    """
-    if sys.platform != 'win32':
-        return
-
-    iface_idx = _get_physical_iface_index()
-    if iface_idx is None:
-        return
-
-    try:
-        import urllib3.util.connection as urllib3_conn
-
-        # Save original create_connection
-        # 保存原始 create_connection
-        _orig_create = urllib3_conn.create_connection
-
-        # IP_UNICAST_IF = 0x1F (31) - Windows socket option
-        # IP_UNICAST_IF = 0x1F (31) - Windows socket 选项
-        _IP_UNICAST_IF = 0x1F
-        _iface = iface_idx
-
-        def _patched_create_connection(address, timeout=urllib3_conn._DEFAULT_SOCKET_TIMEOUT,
-                                       source_address=None, socket_options=None):
-            """Patched create_connection that sets IP_UNICAST_IF."""
-            host, port = address
-            family, type_ = urllib3_conn._family_and_type(host, port)
-
-            sock = socket.socket(family, type_)
-
-            # Apply socket options
-            # 应用 socket 选项
-            if socket_options:
-                for opt in socket_options:
-                    try:
-                        sock.setsockopt(*opt)
-                    except OSError:
-                        pass
-
-            # Bind to source address if specified
-            # 如果指定了源地址则绑定
-            if source_address:
-                sock.bind(source_address)
-
-            # Set IP_UNICAST_IF to force traffic through physical interface
-            # 设置 IP_UNICAST_IF 强制流量走物理网卡
-            try:
-                val = struct.pack('I', socket.htonl(_iface))
-                sock.setsockopt(socket.IPPROTO_IP, _IP_UNICAST_IF, val)
-            except OSError:
-                pass
-
-            # Connect
-            # 连接
-            sock.connect((host, port))
-            return sock
-
-        # Apply the patch
-        # 应用补丁
-        urllib3_conn.create_connection = _patched_create_connection
-
-        # Also patch the session's adapter to use the patched connection
-        # 同时修补 session 的 adapter 以使用修补后的连接
-        for prefix in ('http://', 'https://'):
-            adapter = session.get_adapter(prefix)
-            if adapter:
-                adapter._patched = True
-
-    except ImportError:
-        # urllib3 version doesn't support this patching method
-        # urllib3 版本不支持此修补方法
-        pass
-    except Exception:
-        # Graceful fallback - existing SourceIPAdapter will still work
-        # 优雅降级 - 现有的 SourceIPAdapter 仍然有效
-        pass
 
 
 class Srun_Py:
@@ -378,22 +152,16 @@ class Srun_Py:
     Srun Gateway Authentication Client.
     深澜网关认证客户端。
 
-    This class handles authentication with Srun gateway systems.
-    该类处理与深澜网关系统的认证。
+    TUN 代理适配说明：
+    - trust_env=False: 不读取系统代理环境变量
+    - session.proxies 清空: 不走应用层代理
+    - _make_request: 4 级回退（域名HTTPS → IP HTTPS → 域名HTTP → IP HTTP）
+    - InsecureRequestWarning 已全局禁用（IP 回退时 SSL 证书不匹配不会刷屏）
     """
 
     def __init__(self, srun_host: str = 'gw.imust.edu.cn',
                  host_ip: str = '10.16.42.48',
                  client_ip: Optional[str] = None) -> None:
-        """
-        Initialize Srun client.
-        初始化深澜客户端。
-
-        Args / 参数:
-            srun_host: Gateway hostname / 网关主机名
-            host_ip: Gateway IP address / 网关 IP 地址
-            client_ip: Client IP address to bind (optional) / 要绑定的客户端 IP（可选）
-        """
         self.srun_host = srun_host
         self.host_ip = host_ip
         self.init_url = f"https://{srun_host}"
@@ -417,64 +185,27 @@ class Srun_Py:
         self.client_ip = client_ip
         self.session = requests.Session()
 
-        # === TUN 代理兼容性优化 ===
-        # 禁用 session 读取系统代理环境变量（HTTP_PROXY / HTTPS_PROXY / ALL_PROXY）
-        # Disable session from reading system proxy env vars
+        # === TUN 代理适配 ===
+        # 不读取系统代理环境变量（HTTP_PROXY / HTTPS_PROXY / ALL_PROXY）
         self.session.trust_env = False
-        # 清空 session 级别的代理设置
-        # Clear session-level proxy settings
-        self.session.proxies = {
-            'http': '',
-            'https': '',
-        }
-
-        # 安装 Windows TUN 代理绕过（IP_UNICAST_IF）
-        # Install Windows TUN proxy bypass (IP_UNICAST_IF)
-        _install_tun_bypass(self.session)
+        # 清空 session 级别代理设置
+        self.session.proxies = {'http': '', 'https': ''}
 
         # 如果指定了 client_ip，绑定到该源地址
-        # If client_ip is specified, bind to that source address
         if self.client_ip:
             adapter = SourceIPAdapter(self.client_ip)
             self.session.mount('http://', adapter)
             self.session.mount('https://', adapter)
-        else:
-            self.detected_ip = None
 
     def _make_request(self, method: str, url: str, fallback_url: str,
                       use_ip_fallback: bool = True, **kwargs) -> requests.Response:
         """
-        Make an HTTP request with TUN proxy bypass and fallback strategy.
-        发送 HTTP 请求，支持 TUN 代理绕过和回退策略。
-
-        Strategy / 策略:
-        1. Try domain URL first (https) / 先尝试域名 URL（https）
-        2. Fall back to IP URL (https) / 回退到 IP URL（https）
-        3. Fall back to domain URL (http) / 回退到域名 URL（http）
-        4. Fall back to IP URL (http) / 回退到 IP URL（http）
-
-        Args / 参数:
-            method: HTTP method / HTTP 方法
-            url: Primary URL (domain-based) / 主 URL（基于域名）
-            fallback_url: Fallback URL (IP-based) / 回退 URL（基于 IP）
-            use_ip_fallback: Whether to try IP fallback / 是否尝试 IP 回退
-            **kwargs: Additional arguments for requests / requests 的额外参数
-
-        Returns / 返回:
-            Response object / 响应对象
-
-        Raises / 抛出:
-            requests.RequestException: If all attempts fail / 如果所有尝试都失败
+        发送 HTTP 请求，自动适配 TUN 代理环境。
+        4 级回退：域名HTTPS → IP HTTPS → 域名HTTP → IP HTTP
         """
-        # Set a reasonable timeout to avoid hanging on TUN-intercepted connections
-        # 设置合理的超时时间，避免 TUN 拦截的连接挂起
-        kwargs.setdefault('timeout', (3, 10))  # (connect_timeout, read_timeout)
-
-        # Disable SSL verification for IP-based URLs (certificate won't match)
-        # 对 IP URL 禁用 SSL 验证（证书不匹配）
+        kwargs.setdefault('timeout', (3, 10))
         last_error = None
 
-        # Attempt 1: Domain URL with HTTPS
         # 尝试1: 域名 URL + HTTPS
         try:
             return self.session.request(method, url, **kwargs)
@@ -482,7 +213,6 @@ class Srun_Py:
             last_error = e
 
         if use_ip_fallback:
-            # Attempt 2: IP URL with HTTPS (verify=False for cert mismatch)
             # 尝试2: IP URL + HTTPS（证书不匹配，verify=False）
             try:
                 kwargs_fallback = {**kwargs, 'verify': False}
@@ -490,7 +220,6 @@ class Srun_Py:
             except Exception as e:
                 last_error = e
 
-        # Attempt 3: Domain URL with HTTP
         # 尝试3: 域名 URL + HTTP
         try:
             url_http = url.replace('https://', 'http://', 1)
@@ -499,7 +228,6 @@ class Srun_Py:
             last_error = e
 
         if use_ip_fallback:
-            # Attempt 4: IP URL with HTTP
             # 尝试4: IP URL + HTTP
             try:
                 fallback_url_http = fallback_url.replace('https://', 'http://', 1)
@@ -510,16 +238,7 @@ class Srun_Py:
         raise last_error
 
     def get_base64(self, s: str) -> str:
-        """
-        Custom base64 encoding using Srun's alphabet.
-        使用深澜的字母表进行自定义 base64 编码。
-
-        Args / 参数:
-            s: String to encode / 要编码的字符串
-
-        Returns / 返回:
-            Encoded string / 编码后的字符串
-        """
+        """Custom base64 encoding using Srun's alphabet."""
         r = []
         x = len(s) % 3
         if x:
@@ -540,20 +259,7 @@ class Srun_Py:
 
     def get_chksum(self, username: str, token: str, hmd5: str,
                    ip: str, i: str) -> str:
-        """
-        Generate checksum for authentication.
-        生成认证校验和。
-
-        Args / 参数:
-            username: Username / 用户名
-            token: Authentication token / 认证令牌
-            hmd5: MD5 hash / MD5 哈希
-            ip: IP address / IP 地址
-            i: Info string / 信息字符串
-
-        Returns / 返回:
-            SHA1 checksum / SHA1 校验和
-        """
+        """Generate checksum for authentication."""
         chkstr = token + username
         chkstr += token + hmd5
         chkstr += token + self.ac_id
@@ -564,18 +270,7 @@ class Srun_Py:
         return chkstr
 
     def get_info(self, username: str, password: str, ip: str) -> str:
-        """
-        Build info string for authentication.
-        构建认证信息字符串。
-
-        Args / 参数:
-            username: Username / 用户名
-            password: Password / 密码
-            ip: IP address / IP 地址
-
-        Returns / 返回:
-            JSON info string / JSON 信息字符串
-        """
+        """Build info string for authentication."""
         info_temp = {
             "username": username,
             "password": password,
@@ -588,13 +283,7 @@ class Srun_Py:
         return i
 
     def init_getip(self) -> Tuple[str, Optional[str]]:
-        """
-        Get current IP and username from gateway.
-        从网关获取当前 IP 和用户名。
-
-        Returns / 返回:
-            Tuple of (IP address, username) / (IP 地址, 用户名) 的元组
-        """
+        """Get current IP and username from gateway."""
         res = self._make_request('GET', self.get_ip_api, self.get_ip_api_ip)
         data = json.loads(res.text[res.text.find('(') + 1:-1])
         ip = data.get('client_ip') or data.get('online_ip')
@@ -602,17 +291,7 @@ class Srun_Py:
         return ip, username
 
     def get_token(self, username: str, ip: str) -> str:
-        """
-        Get authentication token from gateway.
-        从网关获取认证令牌。
-
-        Args / 参数:
-            username: Username / 用户名
-            ip: IP address / IP 地址
-
-        Returns / 返回:
-            Authentication token / 认证令牌
-        """
+        """Get authentication token from gateway."""
         get_challenge_params = {
             "callback": (
                 "jQuery112404953340710317169_" +
@@ -630,14 +309,7 @@ class Srun_Py:
         return token
 
     def is_connected(self) -> Tuple[bool, bool, Optional[Dict]]:
-        """
-        Check if the client is connected to the gateway.
-        检查客户端是否连接到网关。
-
-        Returns / 返回:
-            Tuple of (is_available, is_online, data) /
-            (是否可用, 是否在线, 数据) 的元组
-        """
+        """Check if the client is connected to the gateway."""
         try:
             res = self._make_request('GET', self.get_ip_api, self.get_ip_api_ip)
             data = json.loads(res.text[res.text.find('(') + 1:-1])
@@ -650,19 +322,7 @@ class Srun_Py:
 
     def do_complex_work(self, username: str, password: str,
                         ip: str, token: str) -> Tuple[str, str, str]:
-        """
-        Perform complex authentication work (encoding and hashing).
-        执行复杂的认证工作（编码和哈希）。
-
-        Args / 参数:
-            username: Username / 用户名
-            password: Password / 密码
-            ip: IP address / IP 地址
-            token: Authentication token / 认证令牌
-
-        Returns / 返回:
-            Tuple of (info, hmd5, chksum) / (信息, MD5哈希, 校验和) 的元组
-        """
+        """Perform complex authentication work (encoding and hashing)."""
         i = self.get_info(username, password, ip)
         i = "{SRBX1}" + self.get_base64(get_xencode(i, token))
         hmd5 = get_md5(password, token)
@@ -670,16 +330,7 @@ class Srun_Py:
         return i, hmd5, chksum
 
     def _parse_portal_payload(self, raw: str) -> Dict:
-        """
-        Parse raw portal response (JSON or JSONP) into a dictionary.
-        将门户原始响应（JSON 或 JSONP）解析为字典。
-
-        Args / 参数:
-            raw: Raw response text / 原始响应文本
-
-        Returns / 返回:
-            Parsed payload dictionary / 解析后的载荷字典
-        """
+        """Parse raw portal response (JSON or JSONP) into a dictionary."""
         text = (raw or '').strip()
         if not text:
             return {}
@@ -698,10 +349,7 @@ class Srun_Py:
         return {}
 
     def update_acid(self) -> None:
-        """
-        Update AC ID from gateway redirect URL.
-        从网关重定向 URL 更新 AC ID。
-        """
+        """Update AC ID from gateway redirect URL."""
         response = self.session.get(
             url=self.init_url.replace('https', 'http', 1),
             allow_redirects=True, timeout=(3, 10)
@@ -712,21 +360,7 @@ class Srun_Py:
             self.ac_id = query_params['ac_id'][0]
 
     def login(self, username: str, password: str) -> bool:
-        """
-        Login to the gateway.
-        登录到网关。
-
-        Args / 参数:
-            username: Username / 用户名
-            password: Password / 密码
-
-        Returns / 返回:
-            True if login successful / 登录成功返回 True
-
-        Raises / 抛出:
-            Exception: If already online or network not available /
-                      如果已在线或网络不可用
-        """
+        """Login to the gateway."""
         is_available, is_online, _ = self.is_connected()
         if not is_available or is_online:
             raise Exception('You are already online or the network is not available!')
@@ -763,8 +397,6 @@ class Srun_Py:
         if not is_available or not is_online:
             raise Exception('You are not online or the network is not available!')
 
-        # Align with login flow: refresh AC ID before portal logout.
-        # 与登录流程对齐：注销前刷新 AC ID。
         try:
             self.update_acid()
         except Exception:
@@ -791,8 +423,6 @@ class Srun_Py:
         res_code = str(payload.get('res', '')).lower()
         msg_code = str(payload.get('error_msg', '')).lower()
 
-        # Compatible with different gateway return shapes.
-        # 兼容不同网关返回结构。
         if (
             error_code in {'ok', 'logout_ok'} or
             res_code in {'ok', 'logout_ok'} or
@@ -801,24 +431,12 @@ class Srun_Py:
         ):
             return True
 
-        # Fallback to DM-style logout when portal logout did not clearly succeed.
-        # 当 portal 注销未明确成功时，回退到 DM 风格注销。
         dm_res = self.logout_classic()
         dm_text = dm_res.strip().lower()
         return dm_text in {'ok', 'logout_ok', 'success', '1', 'true'}
 
     def logout_classic(self) -> str:
-        """
-        Logout from the gateway.
-        从网关注销。
-
-        Returns / 返回:
-            True if logout successful / 注销成功返回 True
-
-        Raises / 抛出:
-            Exception: If not online or network not available /
-                      如果未在线或网络不可用
-        """
+        """Logout from the gateway using DM-style."""
         ip, username = self.init_getip()
         t = int(time.time() * 1000)
         sign = get_sha1(str(t) + username + ip + '0' + str(t))

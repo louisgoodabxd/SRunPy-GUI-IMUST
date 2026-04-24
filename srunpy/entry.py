@@ -248,15 +248,15 @@ def Main() -> None:
 
 def Build() -> None:
     """
-    Build standalone executable using Nuitka (Windows only).
-    使用 Nuitka 构建独立可执行文件（仅限 Windows）。
+    Build standalone executable using PyInstaller (Windows only).
+    使用 PyInstaller 构建独立可执行文件（仅限 Windows）。
     """
     if platform.system() != 'Windows':
         print('此命令仅支持Windows系统 This command is only supported on Windows system')
         return
 
     try:
-        import nuitka  # noqa: F401
+        import PyInstaller  # noqa: F401
     except ImportError:
         print('请先安装依赖 Please install dependencies')
         print('你可以使用以下命令 You can use the following command')
@@ -274,32 +274,14 @@ def Build() -> None:
         '--default_key', action="store_true",
         help='使用默认密钥 Use default key'
     )
-    parser.add_argument(
-        '--icon', default=None,
-        help='图标路径 Icon path'
-    )
-    parser.add_argument(
-        '--version', default=None,
-        help='版本号 Version'
-    )
-    parser.add_argument(
-        '--company', default=None,
-        help='公司名称 Company name'
-    )
-    parser.add_argument(
-        '--product', default=None,
-        help='产品名称 Product name'
-    )
-    parser.add_argument(
-        '--description', default=None,
-        help='文件描述 File description'
-    )
     args = parser.parse_args()
 
     import os
     import random
     import string
     import sys
+    import subprocess
+    import shutil
 
     python_path = os.path.abspath(sys.executable)
     if python_path.endswith('pythonw.exe'):
@@ -310,18 +292,18 @@ def Build() -> None:
 
     # Get output path / 获取输出路径
     if args.path is not None:
-        path = args.path
+        output_path = args.path
     else:
         desktop_path = os.path.join(os.path.expanduser("~"), 'Desktop')
         default_path = os.path.join(desktop_path, 'SrunPy')
         print('请输入输出文件夹路径 Please enter the output folder path')
-        path = input(f'[{default_path}]')
-        if path == '':
-            path = default_path
+        output_path = input(f'[{default_path}]')
+        if output_path == '':
+            output_path = default_path
 
     # Create output directory / 创建输出目录
-    if not os.path.exists(path):
-        os.makedirs(path)
+    if not os.path.exists(output_path):
+        os.makedirs(output_path)
     else:
         res = input(
             '文件夹已存在,是否覆盖? The folder already exists, '
@@ -332,67 +314,69 @@ def Build() -> None:
 
     # Generate entry point file / 生成入口点文件
     aes_key = ''.join(random.sample(string.ascii_letters + string.digits, 16))
-    with open(os.path.join(path, 'SRunClient.py'), 'w', encoding='utf-8') as f:
+    entry_file = os.path.join(output_path, 'SRunClient.py')
+    with open(entry_file, 'w', encoding='utf-8') as f:
         f.write("from srunpy.entry import Gui\n")
         if args.default_key:
             f.write("Gui()\n")
         else:
             f.write(f"Gui('{aes_key}')\n")
 
-    # Compile / 编译
-    from srunpy import WebRoot, __version__
-    os.chdir(path)
+    # Build with PyInstaller / 使用 PyInstaller 编译
+    from srunpy import WebRoot
+    spec_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                             'srun_client.spec')
 
-    # Set compilation parameters / 设置编译参数
-    if args.icon is not None and os.path.exists(args.icon):
-        icon_path = args.icon
-    else:
-        icon_path = os.path.join(WebRoot, 'icons/logo.ico')
+    print('编译中 Compiling (PyInstaller)...')
+    print(f'入口文件: {entry_file}')
 
-    if args.version is not None:
-        file_version = args.version
-        product_version = args.version
-    else:
-        file_version = __version__
-        product_version = __version__
-
-    if args.company is not None:
-        company_name = args.company
-    else:
-        company_name = 'HopeOFNature'
-
-    if args.product is not None:
-        product_name = args.product
-    else:
-        product_name = 'SRun Authenticator'
-
-    if args.description is not None:
-        file_description = args.description
-    else:
-        file_description = 'SRun Authenticator'
-
-    execute = [
-        python_path, '-m', 'nuitka', '--lto=no',
-        '--standalone', 'SRunClient.py',
-        f'--include-data-dir="{WebRoot}"=srunpy/html',
-        '--windows-console-mode=attach',
-        f'--windows-icon-from-ico="{icon_path}"',
-        f'--file-version="{file_version}"',
-        f'--product-version="{product_version}"',
-        f'--company-name="{company_name}"',
-        f'--product-name="{product_name}"',
-        f'--file-description="{file_description}"'
+    # 使用 PyInstaller API 编译
+    pyinstaller_args = [
+        '--clean',
+        '--noconfirm',
+        '--distpath', output_path,
+        '--workpath', os.path.join(output_path, '_build_tmp'),
+        '--specpath', output_path,
     ]
 
-    print('编译中 Compiling')
-    print(' '.join(execute))
-    os.system(' '.join(execute))
-
-    exe_path = os.path.join(path, 'SRunClient.dist', 'SRunClient.exe')
-    if not os.path.exists(exe_path):
-        print('编译失败,请查看错误信息 Compile failed, please check the error message')
-        return
+    # 如果有 spec 文件则使用，否则用命令行参数
+    if os.path.exists(spec_file):
+        pyinstaller_args.append(spec_file)
     else:
+        # 无 spec 文件时使用命令行参数
+        icon_path = os.path.join(WebRoot, 'icons', 'logo.ico')
+        html_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'srunpy', 'html'
+        )
+        pyinstaller_args.extend([
+            '--onefile',
+            '--console',
+            '--name', 'SRunClient',
+            '--icon', icon_path,
+            '--add-data', f'{html_dir};srunpy/html',
+            entry_file,
+        ])
+
+    try:
+        from PyInstaller.__main__ import run as pyinstaller_run
+        print(f'pyinstaller {" ".join(pyinstaller_args)}')
+        pyinstaller_run(pyinstaller_args)
+    except SystemExit as e:
+        if e.code != 0:
+            print(f'PyInstaller 返回码: {e.code}')
+    except Exception as exc:
+        print(f'编译异常: {exc}')
+
+    # Check result / 检查结果
+    exe_path = os.path.join(output_path, 'dist', 'SRunClient.exe')
+    if not os.path.exists(exe_path):
+        # 尝试其他可能的输出路径
+        exe_path_alt = os.path.join(output_path, 'SRunClient.exe')
+        if os.path.exists(exe_path_alt):
+            exe_path = exe_path_alt
+
+    if os.path.exists(exe_path):
         print('编译完成 Compile completed')
         if not args.default_key:
             print(
@@ -401,10 +385,17 @@ def Build() -> None:
             )
         print('请在以下路径查看可执行文件 Please check the executable file in the following path')
         print(os.path.abspath(exe_path))
+
+        # 清理临时文件
+        build_tmp = os.path.join(output_path, '_build_tmp')
+        if os.path.exists(build_tmp):
+            shutil.rmtree(build_tmp, ignore_errors=True)
+
         res = input('是否立即启动程序? Whether to start the program immediately? (Y/n)')
         if res.lower() == 'n':
             return
-        # Start program in background and exit / 后台启动程序并退出
-        os.system('start ' + exe_path)
-        return
+        os.system('start "" "' + exe_path + '"')
+    else:
+        print('编译失败,请查看错误信息 Compile failed, please check the error message')
+        print(f'期望的输出路径: {exe_path}')
 

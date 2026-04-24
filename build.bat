@@ -1,10 +1,10 @@
 @echo off
 chcp 65001 >nul 2>&1
-title SRunPy-GUI 编译工具
+title SRunPy-GUI 编译工具 (PyInstaller)
 
 echo ============================================
 echo   SRunPy-GUI 校园网登录器 编译工具
-echo   适用于: 内蒙古科技大学 (IMUST)
+echo   编译引擎: PyInstaller (无需 C 编译器)
 echo ============================================
 echo.
 
@@ -14,7 +14,7 @@ echo.
 echo [1/5] 检查 Python 环境...
 python --version >nul 2>&1
 if %errorlevel% neq 0 (
-    echo [错误] 未找到 Python，请先安装 Python 3.7+
+    echo [错误] 未找到 Python，请先安装 Python 3.8-3.12
     echo 下载地址: https://www.python.org/downloads/
     echo 安装时请勾选 "Add Python to PATH"
     pause
@@ -30,7 +30,7 @@ echo.
 echo [2/5] 安装依赖包...
 echo       (首次运行较慢，后续会跳过)
 echo.
-pip install requests pycryptodome pystray pywebview pywin32 win10toast nuitka ordered-set zstandard --quiet 2>nul
+pip install requests pycryptodome pystray pywebview pywin32 win10toast Pillow pyinstaller --quiet 2>nul
 if %errorlevel% neq 0 (
     echo [警告] 部分依赖安装失败，尝试继续...
 )
@@ -53,32 +53,30 @@ if "%AESKEY%"=="" (
     exit /b 1
 )
 
-:: 创建编译输出目录
-if not exist "%~dp0SrunPy_Output" mkdir "%~dp0SrunPy_Output"
-
-:: 写入入口文件
+:: 写入入口文件 (在项目根目录)
 (
     echo from srunpy.entry import Gui
     echo Gui^('%AESKEY%'^)
-) > "%~dp0SrunPy_Output\SRunClient.py"
+) > "%~dp0SRunClient.py"
 
 echo       密钥已生成并写入入口文件
-echo       输出目录: %~dp0SrunPy_Output
 echo.
 
 :: ============================================
-:: 第4步: 编译
+:: 第4步: 编译 (PyInstaller)
 :: ============================================
-echo [4/5] 开始编译 (可能需要 3-10 分钟)...
+echo [4/5] 开始编译 (通常需要 1-3 分钟)...
 echo       请耐心等待，不要关闭此窗口
 echo.
 echo ----------------------------------------
 
-cd /d "%~dp0SrunPy_Output"
+cd /d "%~dp0"
 
-python -m nuitka --lto=no --standalone SRunClient.py --include-data-dir="%~dp0srunpy\html"=srunpy/html --windows-console-mode=attach --windows-icon-from-ico="%~dp0srunpy\html\icons\logo.ico" --file-version="1.0.9.1" --product-version="1.0.9.1" --company-name="IMUST" --product-name="IMUST Campus Login" --file-description="IMUST Campus Network Login Client"
+:: 使用 spec 文件编译 (单文件模式)
+pyinstaller --clean --noconfirm srun_client.spec
 
 echo ----------------------------------------
+echo.
 echo.
 
 :: ============================================
@@ -86,26 +84,31 @@ echo.
 :: ============================================
 echo [5/5] 检查编译结果...
 
-if exist "%~dp0SrunPy_Output\SRunClient.dist\SRunClient.exe" (
+if exist "%~dp0dist\SRunClient.exe" (
     echo.
     echo ============================================
     echo   编译成功!
     echo ============================================
     echo.
     echo   可执行文件位置:
-    echo   %~dp0SrunPy_Output\SRunClient.dist\SRunClient.exe
+    echo   %~dp0dist\SRunClient.exe
     echo.
     echo   使用说明:
-    echo   1. 将 SRunClient.dist 整个文件夹复制到目标电脑
-    echo   2. 双击 SRunClient.exe 即可运行
+    echo   1. 将 SRunClient.exe 复制到目标电脑
+    echo   2. 双击即可运行
     echo   3. 首次运行会自动创建配置文件
     echo   4. 配置文件位于: %%APPDATA%%\SRunPy\config.json
     echo.
     echo   注意: 请删除 SRunClient.py 以保护加密密钥
     echo.
+
+    :: 清理临时文件
+    if exist "%~dp0build" rmdir /s /q "%~dp0build"
+    if exist "%~dp0SRunClient.spec" del /q "%~dp0SRunClient.py"
+
     set /p OPEN="是否打开输出文件夹? (Y/n): "
     if /i not "%OPEN%"=="n" (
-        explorer "%~dp0SrunPy_Output\SRunClient.dist"
+        explorer "%~dp0dist"
     )
 ) else (
     echo.
@@ -115,13 +118,12 @@ if exist "%~dp0SrunPy_Output\SRunClient.dist\SRunClient.exe" (
     echo.
     echo   可能的原因:
     echo   1. Python 版本不兼容 (推荐 3.10-3.12)
-    echo   2. 缺少 C 编译器 (需要 Visual Studio Build Tools)
-    echo   3. 依赖包未正确安装
+    echo   2. 依赖包未正确安装
+    echo   3. 权限不足 (尝试以管理员身份运行)
     echo.
     echo   解决方案:
-    echo   - 安装 Visual Studio Build Tools:
-    echo     https://visualstudio.microsoft.com/visual-cpp-build-tools/
-    echo   - 安装时选择 "C++ 桌面开发" 工作负载
+    echo   - 重新安装依赖: pip install requests pycryptodome pystray pywebview pywin32 win10toast Pillow pyinstaller
+    echo   - 查看上方的错误信息
     echo.
 )
 
